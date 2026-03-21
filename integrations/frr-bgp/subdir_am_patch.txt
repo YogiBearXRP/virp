@@ -1,0 +1,28 @@
+# ---------------------------------------------------------
+# VIRP BGP Observation Module
+# Add this block to bgpd/subdir.am
+#
+# Option A: Loadable module (recommended — can enable/disable at runtime)
+# ---------------------------------------------------------
+
+if BGPD
+module_LTLIBRARIES += bgpd/bgpd_virp.la
+endif
+
+bgpd_bgpd_virp_la_SOURCES = bgpd/bgp_virp.c
+bgpd_bgpd_virp_la_LIBADD = lib/libfrr.la bgpd/libbgp.a -lssl -lcrypto
+bgpd_bgpd_virp_la_LDFLAGS = -avoid-version -module -shared -export-dynamic
+
+noinst_HEADERS += bgpd/bgp_virp.h
+
+# ---------------------------------------------------------
+# Option B: Compiled directly into bgpd (alternative)
+# Replace Option A with this if you don't want a loadable module.
+# Uncomment and add to the existing bgpd_bgpd_SOURCES block:
+#
+#   bgpd/bgp_virp.c
+#
+# And add to bgpd_bgpd_LDADD:
+#
+#   -lssl -lcrypto
+# ---------------------------------------------------------
