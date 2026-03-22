@@ -9,6 +9,9 @@
  * Architecture:
  *   bgpd ──[hooks]──> bgp_virp.c ──[signed obs]──> O-Node (chain.db)
  *
+ * Wire format: canonical packed header (network byte order) + JSON
+ * payload + HMAC-SHA256 over serialized header + payload.
+ *
  * This module is strictly Observation Channel — it never modifies
  * routing state. All observations are read-only attestations.
  *
@@ -35,14 +38,19 @@
 #include "lib/hook.h"
 #include "lib/frr_pthread.h"
 
+#include <arpa/inet.h>
 #include <openssl/hmac.h>
 #include <openssl/evp.h>
+#include <stdarg.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <time.h>
 
 /* Memory type for VIRP allocations */
 DEFINE_MTYPE_STATIC(BGPD, VIRP, "BGP VIRP");
+
+#define VIRP_JSON_BUF    VIRP_MAX_PAYLOAD
+#define VIRP_ADDR_STRLEN INET6_ADDRSTRLEN
 
 /* Module-global config — single instance */
 static struct virp_config virp_cfg = {
@@ -51,6 +59,7 @@ static struct virp_config virp_cfg = {
 	.hmac_key_path = "/etc/virp/bgp.key",
 	.onode_fd = -1,
 	.sequence = 0,
+	.producer_id = 0,
 	.obs_signed = 0,
 	.obs_delivered = 0,
 	.obs_dropped = 0,
@@ -58,51 +67,95 @@ static struct virp_config virp_cfg = {
 	.send_failures = 0,
 };
 
-/*
- * virp_json_escape — escape a string for safe embedding in JSON.
- * Handles \, ", control characters. Returns bytes written (excluding NUL),
- * or dst_size-1 if truncated. Output is always NUL-terminated.
- */
-static size_t virp_json_escape(char *dst, size_t dst_size, const char *src)
+/* ================================================================
+ * Byte-order helpers
+ * ================================================================ */
+
+static uint64_t virp_hton64(uint64_t v)
+{
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+	return ((uint64_t)htonl((uint32_t)(v >> 32))) |
+	       ((uint64_t)htonl((uint32_t)(v & 0xffffffffU)) << 32);
+#else
+	return v;
+#endif
+}
+
+/* ================================================================
+ * Time
+ * ================================================================ */
+
+uint64_t virp_get_time_ns(void)
+{
+	struct timespec ts;
+
+	if (clock_gettime(CLOCK_REALTIME, &ts) != 0)
+		return 0;
+
+	return ((uint64_t)ts.tv_sec * 1000000000ULL) + (uint64_t)ts.tv_nsec;
+}
+
+/* ================================================================
+ * Zeroize
+ * ================================================================ */
+
+static void virp_zeroize(void *p, size_t len)
+{
+	volatile uint8_t *vp = (volatile uint8_t *)p;
+
+	while (len-- > 0)
+		*vp++ = 0;
+}
+
+/* ================================================================
+ * JSON helpers
+ * ================================================================ */
+
+size_t virp_json_escape(char *dst, size_t dst_size, const char *src)
 {
 	size_t di = 0;
-	const char *s;
+	const unsigned char *s = (const unsigned char *)src;
 
 	if (!dst || dst_size == 0)
 		return 0;
 
-	for (s = src; *s && di < dst_size - 1; s++) {
-		unsigned char c = (unsigned char)*s;
+	if (!src) {
+		dst[0] = '\0';
+		return 0;
+	}
+
+	while (*s && di + 1 < dst_size) {
+		unsigned char c = *s++;
+
 		switch (c) {
 		case '"':
 		case '\\':
-			if (di + 2 > dst_size - 1)
+			if (di + 2 >= dst_size)
 				goto out;
 			dst[di++] = '\\';
 			dst[di++] = (char)c;
 			break;
 		case '\n':
-			if (di + 2 > dst_size - 1)
+			if (di + 2 >= dst_size)
 				goto out;
 			dst[di++] = '\\';
 			dst[di++] = 'n';
 			break;
 		case '\r':
-			if (di + 2 > dst_size - 1)
+			if (di + 2 >= dst_size)
 				goto out;
 			dst[di++] = '\\';
 			dst[di++] = 'r';
 			break;
 		case '\t':
-			if (di + 2 > dst_size - 1)
+			if (di + 2 >= dst_size)
 				goto out;
 			dst[di++] = '\\';
 			dst[di++] = 't';
 			break;
 		default:
 			if (c < 0x20) {
-				/* \u00XX for other control chars */
-				if (di + 6 > dst_size - 1)
+				if (di + 6 >= dst_size)
 					goto out;
 				di += snprintf(dst + di, dst_size - di,
 					       "\\u%04x", c);
@@ -112,9 +165,104 @@ static size_t virp_json_escape(char *dst, size_t dst_size, const char *src)
 			break;
 		}
 	}
+
 out:
 	dst[di] = '\0';
 	return di;
+}
+
+static int virp_json_append(char *buf, size_t buf_sz, size_t *off,
+			    const char *fmt, ...)
+	__attribute__((format(printf, 4, 5)));
+
+static int virp_json_append(char *buf, size_t buf_sz, size_t *off,
+			    const char *fmt, ...)
+{
+	va_list ap;
+	int n;
+
+	if (!buf || !off || *off >= buf_sz)
+		return -1;
+
+	va_start(ap, fmt);
+	n = vsnprintf(buf + *off, buf_sz - *off, fmt, ap);
+	va_end(ap);
+
+	if (n < 0)
+		return -1;
+
+	if ((size_t)n >= buf_sz - *off) {
+		*off = buf_sz;
+		return -1;
+	}
+
+	*off += (size_t)n;
+	return 0;
+}
+
+/* ================================================================
+ * Address / identity rendering (inet_ntop, no %pI4)
+ * ================================================================ */
+
+static int virp_in_addr_to_str(const struct in_addr *addr,
+			       char *buf, size_t len)
+{
+	if (!addr || !buf || len == 0)
+		return -1;
+
+	if (!inet_ntop(AF_INET, addr, buf, len))
+		return -1;
+
+	return 0;
+}
+
+static void virp_peer_identity(struct peer *peer,
+			       char *peer_buf, size_t peer_len,
+			       char *peer_addr_buf, size_t peer_addr_len)
+{
+	const char *name = "unknown";
+
+	if (peer && PEER_HOSTNAME(peer))
+		name = PEER_HOSTNAME(peer);
+
+	virp_json_escape(peer_buf, peer_len, name);
+	virp_json_escape(peer_addr_buf, peer_addr_len, name);
+}
+
+static void virp_router_id_json(const struct bgp *bgp,
+				char *out, size_t out_len)
+{
+	char tmp[VIRP_ADDR_STRLEN];
+
+	if (!bgp || virp_in_addr_to_str(&bgp->router_id, tmp, sizeof(tmp)) != 0)
+		strlcpy(tmp, "0.0.0.0", sizeof(tmp));
+
+	virp_json_escape(out, out_len, tmp);
+}
+
+static void virp_nexthop_json(const struct attr *attr,
+			      char *out, size_t out_len)
+{
+	char tmp[VIRP_ADDR_STRLEN];
+
+	if (!attr || virp_in_addr_to_str(&attr->nexthop, tmp, sizeof(tmp)) != 0)
+		strlcpy(tmp, "0.0.0.0", sizeof(tmp));
+
+	virp_json_escape(out, out_len, tmp);
+}
+
+static void virp_aspath_json(const struct attr *attr,
+			     char *out, size_t out_len)
+{
+	const char *aspath = "";
+
+	if (attr && attr->aspath) {
+		const char *printed = aspath_print(attr->aspath);
+		if (printed)
+			aspath = printed;
+	}
+
+	virp_json_escape(out, out_len, aspath);
 }
 
 /* BGP FSM state names for observation payloads */
@@ -133,88 +281,175 @@ static const char *virp_fsm_state_name(enum bgp_fsm_status status)
 	}
 }
 
-/* ----------------------------------------------------------------
- * HMAC Signing
- * ----------------------------------------------------------------
- * Signs observation data with HMAC-SHA256. In production, this calls
- * into libvirp. For the reference implementation, we use OpenSSL
- * directly so the module compiles standalone.
- */
+/* ================================================================
+ * HMAC Key Loading
+ * ================================================================ */
 
-static int virp_load_hmac_key(void)
+int virp_load_hmac_key(struct virp_config *cfg)
 {
 	FILE *f;
 	size_t nread;
 
-	f = fopen(virp_cfg.hmac_key_path, "rb");
+	if (!cfg || !cfg->hmac_key_path[0])
+		return -1;
+
+	f = fopen(cfg->hmac_key_path, "rb");
 	if (!f) {
 		zlog_err("VIRP: cannot open HMAC key file %s: %s",
-			 virp_cfg.hmac_key_path, strerror(errno));
+			 cfg->hmac_key_path, strerror(errno));
 		return -1;
 	}
 
-	nread = fread(virp_cfg.hmac_key, 1, sizeof(virp_cfg.hmac_key), f);
+	nread = fread(cfg->hmac_key, 1, sizeof(cfg->hmac_key), f);
 	fclose(f);
 
-	if (nread < 16) {
-		zlog_err("VIRP: HMAC key too short (%zu bytes, minimum 16)",
-			 nread);
-		return -1;
-	}
-
-	/* Strip trailing \r and \n (handles \n, \r\n, \r) */
-	while (nread > 0 && (virp_cfg.hmac_key[nread - 1] == '\n'
-			     || virp_cfg.hmac_key[nread - 1] == '\r'))
+	while (nread > 0 &&
+	       (cfg->hmac_key[nread - 1] == '\n' ||
+		cfg->hmac_key[nread - 1] == '\r'))
 		nread--;
 
-	virp_cfg.hmac_key_len = nread;
+	if (nread < VIRP_MIN_KEY_LEN) {
+		zlog_err("VIRP: HMAC key too short after trimming (%zu bytes, minimum %u)",
+			 nread, VIRP_MIN_KEY_LEN);
+		virp_zeroize(cfg->hmac_key, sizeof(cfg->hmac_key));
+		cfg->hmac_key_len = 0;
+		return -1;
+	}
+
+	cfg->hmac_key_len = nread;
 	zlog_info("VIRP: loaded %zu-byte HMAC key from %s",
-		  nread, virp_cfg.hmac_key_path);
+		  nread, cfg->hmac_key_path);
 	return 0;
 }
 
-static int virp_sign_observation(struct virp_observation *obs)
+/* ================================================================
+ * Record Construction (canonical wire header)
+ * ================================================================ */
+
+int virp_record_init(struct virp_record *rec,
+		     uint8_t obs_type,
+		     uint8_t trust_tier,
+		     uint32_t producer_id,
+		     uint32_t sequence,
+		     uint64_t timestamp_ns,
+		     const uint8_t *payload,
+		     size_t payload_len)
 {
-	unsigned int hmac_len = 0;
-	unsigned char *result;
-
-	/*
-	 * HMAC covers header + actual payload bytes (not zero padding).
-	 * This matches the wire format: header + payload_len bytes.
-	 */
-	size_t sign_len = offsetof(struct virp_observation, payload)
-			  + obs->payload_len;
-
-	result = HMAC(EVP_sha256(),
-		      virp_cfg.hmac_key, (int)virp_cfg.hmac_key_len,
-		      (unsigned char *)obs, sign_len,
-		      obs->hmac, &hmac_len);
-
-	if (!result || hmac_len != VIRP_HMAC_LEN) {
-		virp_cfg.sign_failures++;
-		zlog_err("VIRP: HMAC-SHA256 signing failed (seq %u)",
-			 obs->sequence);
+	if (!rec)
 		return -1;
+
+	if (payload_len > VIRP_MAX_PAYLOAD)
+		return -1;
+
+	memset(rec, 0, sizeof(*rec));
+
+	rec->hdr.magic_be        = htonl(VIRP_MAGIC);
+	rec->hdr.version         = VIRP_VERSION;
+	rec->hdr.obs_type        = obs_type;
+	rec->hdr.trust_tier      = trust_tier;
+	rec->hdr.flags           = 0;
+	rec->hdr.timestamp_ns_be = virp_hton64(timestamp_ns);
+	rec->hdr.sequence_be     = htonl(sequence);
+	rec->hdr.payload_len_be  = htonl((uint32_t)payload_len);
+	rec->hdr.producer_id_be  = htonl(producer_id);
+
+	rec->payload_len = payload_len;
+
+	if (payload_len > 0 && payload)
+		memcpy(rec->payload, payload, payload_len);
+
+	return 0;
+}
+
+/* ================================================================
+ * Signing — HMAC-SHA256 over serialized wire header + payload
+ * ================================================================ */
+
+int virp_sign_record(struct virp_config *cfg, struct virp_record *rec)
+{
+	HMAC_CTX *ctx = NULL;
+	unsigned int hlen = 0;
+	int rc = -1;
+
+	if (!cfg || !rec || cfg->hmac_key_len == 0) {
+		if (cfg)
+			cfg->sign_failures++;
+		return -1;
+	}
+
+	ctx = HMAC_CTX_new();
+	if (!ctx)
+		goto out;
+
+	if (HMAC_Init_ex(ctx,
+			 cfg->hmac_key,
+			 (int)cfg->hmac_key_len,
+			 EVP_sha256(),
+			 NULL) != 1)
+		goto out;
+
+	if (HMAC_Update(ctx,
+			(const unsigned char *)&rec->hdr,
+			sizeof(rec->hdr)) != 1)
+		goto out;
+
+	if (rec->payload_len > 0 &&
+	    HMAC_Update(ctx, rec->payload, rec->payload_len) != 1)
+		goto out;
+
+	if (HMAC_Final(ctx, rec->hmac, &hlen) != 1)
+		goto out;
+
+	if (hlen != VIRP_HMAC_LEN)
+		goto out;
+
+	rc = 0;
+
+out:
+	if (rc != 0 && cfg)
+		cfg->sign_failures++;
+
+	if (ctx)
+		HMAC_CTX_free(ctx);
+
+	return rc;
+}
+
+/* ================================================================
+ * Transport — AF_UNIX SOCK_STREAM to O-Node
+ * ================================================================ */
+
+static int virp_send_all(int fd, const void *buf, size_t len)
+{
+	const uint8_t *p = (const uint8_t *)buf;
+	size_t sent = 0;
+
+	while (sent < len) {
+		ssize_t n = write(fd, p + sent, len - sent);
+		if (n < 0) {
+			if (errno == EINTR)
+				continue;
+			return -1;
+		}
+		if (n == 0)
+			return -1;
+
+		sent += (size_t)n;
 	}
 
 	return 0;
 }
 
-/* ----------------------------------------------------------------
- * O-Node Socket Communication
- * ----------------------------------------------------------------
- * Connects to the VIRP O-Node daemon over Unix domain socket.
- * The O-Node receives signed observations and appends them to
- * chain.db (SQLite chain store).
- */
-
-static int virp_connect_onode(void)
+static int virp_connect_onode(struct virp_config *cfg)
 {
 	struct sockaddr_un addr;
 	int fd;
 
-	if (virp_cfg.onode_fd >= 0)
-		return 0; /* already connected */
+	if (!cfg || !cfg->onode_socket_path[0])
+		return -1;
+
+	if (cfg->onode_fd >= 0)
+		return 0;
 
 	fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
 	if (fd < 0) {
@@ -224,158 +459,139 @@ static int virp_connect_onode(void)
 
 	memset(&addr, 0, sizeof(addr));
 	addr.sun_family = AF_UNIX;
-	strlcpy(addr.sun_path, virp_cfg.onode_socket_path,
-		sizeof(addr.sun_path));
+	strlcpy(addr.sun_path, cfg->onode_socket_path, sizeof(addr.sun_path));
 
 	if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
 		zlog_err("VIRP: connect to O-Node %s failed: %s",
-			 virp_cfg.onode_socket_path, strerror(errno));
+			 cfg->onode_socket_path, strerror(errno));
 		close(fd);
 		return -1;
 	}
 
-	virp_cfg.onode_fd = fd;
-	zlog_info("VIRP: connected to O-Node at %s",
-		  virp_cfg.onode_socket_path);
+	cfg->onode_fd = fd;
+	zlog_info("VIRP: connected to O-Node at %s", cfg->onode_socket_path);
 	return 0;
 }
 
-/*
- * virp_send_all — loop on partial writes and handle EINTR.
- * Returns 0 on success, -1 on fatal error.
- */
-static int virp_send_all(int fd, const void *data, size_t len)
+int virp_send_record(struct virp_config *cfg, const struct virp_record *rec)
 {
-	const uint8_t *p = data;
-	size_t remaining = len;
+	if (!cfg || !rec)
+		return -1;
 
-	while (remaining > 0) {
-		ssize_t n = write(fd, p, remaining);
-		if (n < 0) {
-			if (errno == EINTR)
-				continue;
-			return -1;
-		}
-		p += n;
-		remaining -= (size_t)n;
-	}
-	return 0;
-}
-
-static int virp_send_observation(struct virp_observation *obs)
-{
-	size_t header_plus_payload;
-
-	/* Reconnect if needed */
-	if (virp_cfg.onode_fd < 0) {
-		if (virp_connect_onode() < 0) {
-			virp_cfg.send_failures++;
-			return -1;
-		}
-	}
-
-	/*
-	 * Wire format: [header 24B][payload N bytes][HMAC 32B]
-	 *
-	 * The HMAC field is at the end of the struct (after the full
-	 * VIRP_MAX_PAYLOAD buffer), so we cannot write the struct as
-	 * one contiguous block. Send header+payload, then HMAC.
-	 */
-	header_plus_payload = offsetof(struct virp_observation, payload)
-			      + obs->payload_len;
-
-	/* Send header + payload */
-	if (virp_send_all(virp_cfg.onode_fd, obs, header_plus_payload) < 0) {
-		zlog_err("VIRP: write header+payload to O-Node failed: %s",
-			 strerror(errno));
-		close(virp_cfg.onode_fd);
-		virp_cfg.onode_fd = -1;
-		virp_cfg.send_failures++;
+	if (virp_connect_onode(cfg) < 0) {
+		cfg->send_failures++;
 		return -1;
 	}
 
-	/* Send HMAC */
-	if (virp_send_all(virp_cfg.onode_fd, obs->hmac, VIRP_HMAC_LEN) < 0) {
-		zlog_err("VIRP: write HMAC to O-Node failed: %s",
-			 strerror(errno));
-		close(virp_cfg.onode_fd);
-		virp_cfg.onode_fd = -1;
-		virp_cfg.send_failures++;
-		return -1;
-	}
+	/* Wire: header || payload || HMAC */
+	if (virp_send_all(cfg->onode_fd, &rec->hdr, sizeof(rec->hdr)) < 0)
+		goto fail;
+
+	if (rec->payload_len > 0 &&
+	    virp_send_all(cfg->onode_fd, rec->payload, rec->payload_len) < 0)
+		goto fail;
+
+	if (virp_send_all(cfg->onode_fd, rec->hmac, VIRP_HMAC_LEN) < 0)
+		goto fail;
 
 	return 0;
+
+fail:
+	zlog_err("VIRP: send to O-Node failed: %s", strerror(errno));
+	close(cfg->onode_fd);
+	cfg->onode_fd = -1;
+	cfg->send_failures++;
+	return -1;
 }
 
-/* ----------------------------------------------------------------
- * Observation Builders
- * ----------------------------------------------------------------
- * Each function constructs a JSON payload from BGP event data,
- * signs it, and sends it to the O-Node.
- */
+/* ================================================================
+ * virp_emit_json — single wrapper for all handlers
+ *
+ * Does init → sign → send and manages obs_signed / obs_delivered /
+ * obs_dropped counters.
+ * ================================================================ */
 
-static uint64_t virp_now_ns(void)
+static int virp_emit_json(uint8_t obs_type,
+			  uint8_t trust_tier,
+			  const char *json,
+			  size_t json_len)
 {
-	struct timespec ts;
-
-	clock_gettime(CLOCK_REALTIME, &ts);
-	return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
-}
-
-static int virp_emit(enum virp_bgp_obs_type type,
-		     enum virp_trust_tier tier,
-		     const char *json_payload, size_t json_len)
-{
-	struct virp_observation obs;
+	struct virp_record rec;
+	uint64_t ts;
 
 	if (!virp_cfg.enabled)
 		return 0;
 
-	if (json_len >= VIRP_MAX_PAYLOAD) {
-		zlog_warn("VIRP: observation payload too large (%zu bytes)",
-			  json_len);
-		json_len = VIRP_MAX_PAYLOAD - 1;
+	if (!json)
+		return -1;
+
+	if (json_len > VIRP_MAX_PAYLOAD) {
+		zlog_warn("VIRP: JSON payload too large (%zu > %u)",
+			  json_len, VIRP_MAX_PAYLOAD);
+		virp_cfg.obs_dropped++;
+		return -1;
 	}
 
-	/* Zero only the fixed header, not the full VIRP_MAX_PAYLOAD buffer */
-	memset(&obs, 0, offsetof(struct virp_observation, payload));
-	obs.magic = htonl(VIRP_MAGIC);
-	obs.version = VIRP_VERSION;
-	obs.obs_type = (uint8_t)type;
-	obs.trust_tier = (uint8_t)tier;
-	obs.timestamp_ns = virp_now_ns();
-	obs.sequence = ++virp_cfg.sequence;
-	obs.payload_len = (uint32_t)json_len;
-	memcpy(obs.payload, json_payload, json_len);
-	obs.payload[json_len] = '\0'; /* NUL-terminate for safety */
+	ts = virp_get_time_ns();
 
-	if (virp_sign_observation(&obs) < 0)
+	if (virp_record_init(&rec,
+			     obs_type,
+			     trust_tier,
+			     virp_cfg.producer_id,
+			     ++virp_cfg.sequence,
+			     ts,
+			     (const uint8_t *)json,
+			     json_len) != 0) {
+		virp_cfg.obs_dropped++;
 		return -1;
+	}
+
+	if (virp_sign_record(&virp_cfg, &rec) != 0) {
+		virp_cfg.obs_dropped++;
+		return -1;
+	}
 
 	virp_cfg.obs_signed++;
 
-	if (virp_send_observation(&obs) < 0) {
+	if (virp_send_record(&virp_cfg, &rec) != 0) {
 		virp_cfg.obs_dropped++;
-		/* Log locally even if O-Node is down */
-		zlog_info("VIRP[%u]: (O-Node unreachable) type=%d tier=%d: %.*s",
-			  obs.sequence, type, tier,
-			  (int)json_len, json_payload);
+		zlog_info("VIRP[%u]: local-fallback type=%u tier=%u payload=%.*s",
+			  virp_cfg.sequence, obs_type, trust_tier,
+			  (int)json_len, json);
 		return -1;
 	}
 
 	virp_cfg.obs_delivered++;
-
-	zlog_debug("VIRP[%u]: type=%d tier=%d len=%u",
-		   obs.sequence, type, tier, obs.payload_len);
+	zlog_debug("VIRP[%u]: type=%u tier=%u len=%zu",
+		   virp_cfg.sequence, obs_type, trust_tier, json_len);
 	return 0;
 }
 
-/* ----------------------------------------------------------------
+/* ================================================================
+ * Producer ID — derived from BGP router-id
+ * ================================================================ */
+
+static uint32_t virp_get_producer_id(const struct bgp *bgp)
+{
+	if (!bgp)
+		return 0;
+	return ntohl(bgp->router_id.s_addr);
+}
+
+static void virp_update_producer_id(const struct bgp *bgp)
+{
+	uint32_t pid = virp_get_producer_id(bgp);
+
+	if (pid != 0)
+		virp_cfg.producer_id = pid;
+}
+
+/* ================================================================
  * BGP Hook Handlers
- * ----------------------------------------------------------------
- * These are the four integration points into FRR's BGP daemon.
- * Each constructs a JSON observation and calls virp_emit().
- */
+ *
+ * Each constructs JSON via virp_json_append(), then calls
+ * virp_emit_json() which does init/sign/send.
+ * ================================================================ */
 
 /*
  * Hook: peer_status_changed
@@ -383,175 +599,228 @@ static int virp_emit(enum virp_bgp_obs_type type,
  */
 static int virp_peer_status_changed(struct peer *peer)
 {
-	char buf[VIRP_MAX_PAYLOAD];
-	char esc_peer[256];
-	char esc_rid[64];
-	int len;
-	enum virp_trust_tier tier = VIRP_TIER_GREEN;
+	char buf[VIRP_JSON_BUF];
+	char peer_id[256];
+	char peer_addr[256];
+	char router_id[64];
+	size_t off = 0;
 	enum bgp_fsm_status old_st, new_st;
+	enum virp_trust_tier tier = VIRP_TIER_GREEN;
 
-	if (!virp_cfg.enabled || !peer || !peer->connection)
+	if (!virp_cfg.enabled || !peer || !peer->connection || !peer->bgp)
 		return 0;
 
 	old_st = peer->connection->ostatus;
 	new_st = peer->connection->status;
 
-	/* Backward transition from Established = YELLOW */
 	if (old_st == Established && new_st != Established)
 		tier = VIRP_TIER_YELLOW;
 
-	virp_json_escape(esc_peer, sizeof(esc_peer), PEER_HOSTNAME(peer));
-	snprintf(esc_rid, sizeof(esc_rid), "%pI4", &peer->bgp->router_id);
+	virp_update_producer_id(peer->bgp);
+	virp_peer_identity(peer,
+			   peer_id, sizeof(peer_id),
+			   peer_addr, sizeof(peer_addr));
+	virp_router_id_json(peer->bgp, router_id, sizeof(router_id));
 
-	len = snprintf(buf, sizeof(buf),
-		"{"
-		"\"domain\":\"bgp\","
-		"\"event\":\"peer_state_change\","
-		"\"peer_ip\":\"%s\","
-		"\"peer_as\":%u,"
-		"\"local_as\":%u,"
-		"\"old_state\":\"%s\","
-		"\"new_state\":\"%s\","
-		"\"router_id\":\"%s\""
-		"}",
-		esc_peer,
-		peer->as,
-		peer->local_as,
-		virp_fsm_state_name(old_st),
-		virp_fsm_state_name(new_st),
-		esc_rid);
-
-	if (len < 0 || (size_t)len >= sizeof(buf))
+	if (virp_json_append(buf, sizeof(buf), &off,
+			     "{"
+			     "\"domain\":\"bgp\","
+			     "\"event\":\"peer_state_change\","
+			     "\"peer\":\"%s\","
+			     "\"peer_addr\":\"%s\","
+			     "\"peer_as\":%u,"
+			     "\"local_as\":%u,"
+			     "\"old_state\":\"%s\","
+			     "\"new_state\":\"%s\","
+			     "\"router_id\":\"%s\","
+			     "\"producer_id\":%u"
+			     "}",
+			     peer_id,
+			     peer_addr,
+			     peer->as,
+			     peer->local_as,
+			     virp_fsm_state_name(old_st),
+			     virp_fsm_state_name(new_st),
+			     router_id,
+			     virp_cfg.producer_id) != 0)
 		return 0;
 
-	virp_emit(VIRP_BGP_PEER_STATE_CHANGE, tier, buf, (size_t)len);
+	(void)virp_emit_json(VIRP_OBS_BGP_PEER_STATE, tier, buf, off);
 	return 0;
 }
 
 /*
  * Hook: peer_backward_transition
  * Fires specifically when a peer drops OUT of Established.
- * This is the alert-grade observation — a neighbor went down.
  */
 static int virp_peer_backward_transition(struct peer *peer)
 {
-	char buf[VIRP_MAX_PAYLOAD];
-	char esc_peer[256];
-	char esc_rid[64];
-	int len;
+	char buf[VIRP_JSON_BUF];
+	char peer_id[256];
+	char peer_addr[256];
+	char router_id[64];
+	size_t off = 0;
 
-	if (!virp_cfg.enabled || !peer || !peer->connection)
+	if (!virp_cfg.enabled || !peer || !peer->connection || !peer->bgp)
 		return 0;
 
-	virp_json_escape(esc_peer, sizeof(esc_peer), PEER_HOSTNAME(peer));
-	snprintf(esc_rid, sizeof(esc_rid), "%pI4", &peer->bgp->router_id);
+	virp_update_producer_id(peer->bgp);
+	virp_peer_identity(peer,
+			   peer_id, sizeof(peer_id),
+			   peer_addr, sizeof(peer_addr));
+	virp_router_id_json(peer->bgp, router_id, sizeof(router_id));
 
-	len = snprintf(buf, sizeof(buf),
-		"{"
-		"\"domain\":\"bgp\","
-		"\"event\":\"peer_down\","
-		"\"peer_ip\":\"%s\","
-		"\"peer_as\":%u,"
-		"\"local_as\":%u,"
-		"\"last_state\":\"%s\","
-		"\"last_event\":%d,"
-		"\"uptime\":%ld,"
-		"\"router_id\":\"%s\""
-		"}",
-		esc_peer,
-		peer->as,
-		peer->local_as,
-		virp_fsm_state_name(peer->connection->ostatus),
-		peer->last_major_event,
-		(long)peer->uptime,
-		esc_rid);
-
-	if (len < 0 || (size_t)len >= sizeof(buf))
+	if (virp_json_append(buf, sizeof(buf), &off,
+			     "{"
+			     "\"domain\":\"bgp\","
+			     "\"event\":\"peer_down\","
+			     "\"peer\":\"%s\","
+			     "\"peer_addr\":\"%s\","
+			     "\"peer_as\":%u,"
+			     "\"local_as\":%u,"
+			     "\"last_state\":\"%s\","
+			     "\"last_event\":%d,"
+			     "\"uptime\":%ld,"
+			     "\"router_id\":\"%s\","
+			     "\"producer_id\":%u"
+			     "}",
+			     peer_id,
+			     peer_addr,
+			     peer->as,
+			     peer->local_as,
+			     virp_fsm_state_name(peer->connection->ostatus),
+			     peer->last_major_event,
+			     (long)peer->uptime,
+			     router_id,
+			     virp_cfg.producer_id) != 0)
 		return 0;
 
-	virp_emit(VIRP_BGP_PEER_BACKWARD_TRANS, VIRP_TIER_YELLOW,
-		  buf, (size_t)len);
+	(void)virp_emit_json(VIRP_OBS_BGP_PEER_BACKWARD, VIRP_TIER_YELLOW,
+			     buf, off);
 	return 0;
 }
 
 /*
  * Hook: bgp_process
  * Fires when BGP processes a route from a peer.
- * The 'withdraw' flag indicates route withdrawal vs announcement.
  */
 static int virp_bgp_process(struct bgp *bgp, afi_t afi, safi_t safi,
 			    struct bgp_dest *dest, struct peer *peer,
 			    bool withdraw)
 {
-	char buf[VIRP_MAX_PAYLOAD];
+	char buf[VIRP_JSON_BUF];
 	char prefix_str[PREFIX_STRLEN];
-	char esc_peer[256];
-	char esc_rid[64];
+	char peer_id[256];
+	char peer_addr[256];
+	char router_id[64];
 	const struct prefix *p;
-	int len;
+	size_t off = 0;
 
-	if (!virp_cfg.enabled || !dest || !peer)
+	if (!virp_cfg.enabled || !bgp || !dest || !peer)
 		return 0;
 
 	p = bgp_dest_get_prefix(dest);
 	if (!p)
 		return 0;
 
+	virp_update_producer_id(bgp);
 	prefix2str(p, prefix_str, sizeof(prefix_str));
-	virp_json_escape(esc_peer, sizeof(esc_peer), PEER_HOSTNAME(peer));
-	snprintf(esc_rid, sizeof(esc_rid), "%pI4", &bgp->router_id);
+	virp_peer_identity(peer,
+			   peer_id, sizeof(peer_id),
+			   peer_addr, sizeof(peer_addr));
+	virp_router_id_json(bgp, router_id, sizeof(router_id));
 
-	len = snprintf(buf, sizeof(buf),
-		"{"
-		"\"domain\":\"bgp\","
-		"\"event\":\"%s\","
-		"\"prefix\":\"%s\","
-		"\"peer_ip\":\"%s\","
-		"\"peer_as\":%u,"
-		"\"afi\":%d,"
-		"\"safi\":%d,"
-		"\"router_id\":\"%s\""
-		"}",
-		withdraw ? "route_withdraw" : "route_announce",
-		prefix_str,
-		esc_peer,
-		peer->as,
-		afi, safi,
-		esc_rid);
-
-	if (len < 0 || (size_t)len >= sizeof(buf))
+	if (virp_json_append(buf, sizeof(buf), &off,
+			     "{"
+			     "\"domain\":\"bgp\","
+			     "\"event\":\"%s\","
+			     "\"prefix\":\"%s\","
+			     "\"peer\":\"%s\","
+			     "\"peer_addr\":\"%s\","
+			     "\"peer_as\":%u,"
+			     "\"afi\":%d,"
+			     "\"safi\":%d,"
+			     "\"router_id\":\"%s\","
+			     "\"producer_id\":%u"
+			     "}",
+			     withdraw ? "route_withdraw" : "route_announce",
+			     prefix_str,
+			     peer_id,
+			     peer_addr,
+			     peer->as,
+			     afi,
+			     safi,
+			     router_id,
+			     virp_cfg.producer_id) != 0)
 		return 0;
 
-	virp_emit(VIRP_BGP_ROUTE_PROCESS, VIRP_TIER_GREEN,
-		  buf, (size_t)len);
+	(void)virp_emit_json(VIRP_OBS_BGP_ROUTE_EVENT, VIRP_TIER_GREEN,
+			     buf, off);
 	return 0;
 }
 
 /*
+ * Path JSON builder for bestpath_change old/new sub-objects.
+ */
+static int virp_append_path_json(char *buf, size_t buf_sz, size_t *off,
+				 const char *field_name,
+				 struct bgp_path_info *route)
+{
+	char peer_id[256];
+	char peer_addr[256];
+	char nexthop[64];
+	char aspath[768];
+
+	if (!route || !route->attr)
+		return virp_json_append(buf, buf_sz, off,
+					"\"%s\":null", field_name);
+
+	virp_peer_identity(route->peer,
+			   peer_id, sizeof(peer_id),
+			   peer_addr, sizeof(peer_addr));
+	virp_nexthop_json(route->attr, nexthop, sizeof(nexthop));
+	virp_aspath_json(route->attr, aspath, sizeof(aspath));
+
+	return virp_json_append(buf, buf_sz, off,
+				"\"%s\":{"
+				"\"peer\":\"%s\","
+				"\"peer_addr\":\"%s\","
+				"\"peer_as\":%u,"
+				"\"nexthop\":\"%s\","
+				"\"as_path\":\"%s\","
+				"\"med\":%u,"
+				"\"local_pref\":%u,"
+				"\"origin\":%u"
+				"}",
+				field_name,
+				peer_id,
+				peer_addr,
+				route->peer ? route->peer->as : 0,
+				nexthop,
+				aspath,
+				route->attr->med,
+				route->attr->local_pref,
+				route->attr->origin);
+}
+
+/*
  * Hook: bgp_route_update
- * Fires on best-path changes. This is the crown jewel — we get both
- * old and new best paths with full attributes (AS path, nexthop, MED,
- * local-pref, origin). A signed attestation of best-path selection.
+ * Fires on best-path changes with full old/new attributes.
  */
 static int virp_bgp_route_update(struct bgp *bgp, afi_t afi, safi_t safi,
 				 struct bgp_dest *dest,
 				 struct bgp_path_info *old_route,
 				 struct bgp_path_info *new_route)
 {
-	char buf[VIRP_MAX_PAYLOAD];
+	char buf[VIRP_JSON_BUF];
 	char prefix_str[PREFIX_STRLEN];
-	char esc_rid[64];
-	char esc_peer[256];
-	char esc_nh[64];
-	char esc_aspath[512];
+	char router_id[64];
 	const struct prefix *p;
-	int len;
-	int off = 0;
+	size_t off = 0;
 
-	if (!virp_cfg.enabled || !dest)
+	if (!virp_cfg.enabled || !bgp || !dest)
 		return 0;
 
-	/* Must have at least one path to observe */
 	if (!old_route && !new_route)
 		return 0;
 
@@ -559,113 +828,45 @@ static int virp_bgp_route_update(struct bgp *bgp, afi_t afi, safi_t safi,
 	if (!p)
 		return 0;
 
+	virp_update_producer_id(bgp);
 	prefix2str(p, prefix_str, sizeof(prefix_str));
-	snprintf(esc_rid, sizeof(esc_rid), "%pI4", &bgp->router_id);
+	virp_router_id_json(bgp, router_id, sizeof(router_id));
 
-	off = snprintf(buf, sizeof(buf),
-		"{"
-		"\"domain\":\"bgp\","
-		"\"event\":\"bestpath_change\","
-		"\"prefix\":\"%s\","
-		"\"afi\":%d,"
-		"\"safi\":%d,"
-		"\"router_id\":\"%s\",",
-		prefix_str,
-		afi, safi,
-		esc_rid);
-
-	if (off < 0 || (size_t)off >= sizeof(buf))
+	if (virp_json_append(buf, sizeof(buf), &off,
+			     "{"
+			     "\"domain\":\"bgp\","
+			     "\"event\":\"bestpath_change\","
+			     "\"prefix\":\"%s\","
+			     "\"afi\":%d,"
+			     "\"safi\":%d,"
+			     "\"router_id\":\"%s\","
+			     "\"producer_id\":%u,",
+			     prefix_str,
+			     afi,
+			     safi,
+			     router_id,
+			     virp_cfg.producer_id) != 0)
 		return 0;
 
-	/* Old best path */
-	if (old_route && old_route->attr) {
-		virp_json_escape(esc_peer, sizeof(esc_peer),
-			old_route->peer ? PEER_HOSTNAME(old_route->peer) : "none");
-		snprintf(esc_nh, sizeof(esc_nh), "%pI4",
-			 &old_route->attr->nexthop);
-		virp_json_escape(esc_aspath, sizeof(esc_aspath),
-			old_route->attr->aspath
-				? aspath_print(old_route->attr->aspath)
-				: "");
-
-		off += snprintf(buf + off, sizeof(buf) - off,
-			"\"old\":{"
-			"\"peer_ip\":\"%s\","
-			"\"peer_as\":%u,"
-			"\"nexthop\":\"%s\","
-			"\"as_path\":\"%s\","
-			"\"med\":%u,"
-			"\"local_pref\":%u,"
-			"\"origin\":%d"
-			"},",
-			esc_peer,
-			old_route->peer ? old_route->peer->as : 0,
-			esc_nh,
-			esc_aspath,
-			old_route->attr->med,
-			old_route->attr->local_pref,
-			old_route->attr->origin);
-	} else {
-		off += snprintf(buf + off, sizeof(buf) - off,
-			"\"old\":null,");
-	}
-
-	if (off < 0 || (size_t)off >= sizeof(buf))
+	if (virp_append_path_json(buf, sizeof(buf), &off, "old", old_route) != 0)
 		return 0;
 
-	/* New best path */
-	if (new_route && new_route->attr) {
-		virp_json_escape(esc_peer, sizeof(esc_peer),
-			new_route->peer ? PEER_HOSTNAME(new_route->peer) : "none");
-		snprintf(esc_nh, sizeof(esc_nh), "%pI4",
-			 &new_route->attr->nexthop);
-		virp_json_escape(esc_aspath, sizeof(esc_aspath),
-			new_route->attr->aspath
-				? aspath_print(new_route->attr->aspath)
-				: "");
-
-		off += snprintf(buf + off, sizeof(buf) - off,
-			"\"new\":{"
-			"\"peer_ip\":\"%s\","
-			"\"peer_as\":%u,"
-			"\"nexthop\":\"%s\","
-			"\"as_path\":\"%s\","
-			"\"med\":%u,"
-			"\"local_pref\":%u,"
-			"\"origin\":%d"
-			"}",
-			esc_peer,
-			new_route->peer ? new_route->peer->as : 0,
-			esc_nh,
-			esc_aspath,
-			new_route->attr->med,
-			new_route->attr->local_pref,
-			new_route->attr->origin);
-	} else {
-		off += snprintf(buf + off, sizeof(buf) - off,
-			"\"new\":null");
-	}
-
-	if (off < 0 || (size_t)off >= sizeof(buf))
+	if (virp_json_append(buf, sizeof(buf), &off, ",") != 0)
 		return 0;
 
-	/* Close JSON */
-	off += snprintf(buf + off, sizeof(buf) - off, "}");
-
-	if (off < 0 || (size_t)off >= sizeof(buf))
+	if (virp_append_path_json(buf, sizeof(buf), &off, "new", new_route) != 0)
 		return 0;
 
-	len = off;
+	if (virp_json_append(buf, sizeof(buf), &off, "}") != 0)
+		return 0;
 
-	virp_emit(VIRP_BGP_BESTPATH_CHANGE, VIRP_TIER_GREEN,
-		  buf, (size_t)len);
+	(void)virp_emit_json(VIRP_OBS_BGP_BESTPATH_CHANGE, VIRP_TIER_GREEN,
+			     buf, off);
 	return 0;
 }
 
-/* ----------------------------------------------------------------
+/* ================================================================
  * VTY Commands
- * ----------------------------------------------------------------
- * FRR CLI integration for configuring and monitoring VIRP.
  *
  *   router bgp 65000
  *     virp enable
@@ -674,7 +875,7 @@ static int virp_bgp_route_update(struct bgp *bgp, afi_t afi, safi_t safi,
  *   !
  *   show bgp virp status
  *   show bgp virp statistics
- */
+ * ================================================================ */
 
 DEFUN(virp_enable,
       virp_enable_cmd,
@@ -683,7 +884,7 @@ DEFUN(virp_enable,
       "Enable VIRP signed observations\n")
 {
 	if (virp_cfg.hmac_key_len == 0) {
-		if (virp_load_hmac_key() < 0) {
+		if (virp_load_hmac_key(&virp_cfg) < 0) {
 			vty_out(vty, "%% Cannot load HMAC key from %s\n",
 				virp_cfg.hmac_key_path);
 			return CMD_WARNING;
@@ -691,7 +892,7 @@ DEFUN(virp_enable,
 	}
 
 	virp_cfg.enabled = true;
-	virp_connect_onode(); /* best-effort, will retry on emit */
+	virp_connect_onode(&virp_cfg);
 
 	vty_out(vty, "VIRP: observation signing enabled\n");
 	return CMD_SUCCESS;
@@ -725,7 +926,6 @@ DEFUN(virp_onode_socket,
 	strlcpy(virp_cfg.onode_socket_path, argv[2]->arg,
 		sizeof(virp_cfg.onode_socket_path));
 
-	/* Reconnect if already running */
 	if (virp_cfg.onode_fd >= 0) {
 		close(virp_cfg.onode_fd);
 		virp_cfg.onode_fd = -1;
@@ -746,7 +946,7 @@ DEFUN(virp_hmac_key_path,
 	strlcpy(virp_cfg.hmac_key_path, argv[2]->arg,
 		sizeof(virp_cfg.hmac_key_path));
 
-	if (virp_load_hmac_key() < 0) {
+	if (virp_load_hmac_key(&virp_cfg) < 0) {
 		vty_out(vty, "%% Failed to load key from %s\n",
 			virp_cfg.hmac_key_path);
 		return CMD_WARNING;
@@ -772,7 +972,14 @@ DEFUN(show_bgp_virp_status,
 		virp_cfg.onode_fd >= 0 ? "connected" : "disconnected");
 	vty_out(vty, "  HMAC key:       %s (%zu bytes)\n",
 		virp_cfg.hmac_key_path, virp_cfg.hmac_key_len);
+	vty_out(vty, "  Producer ID:    %u\n", virp_cfg.producer_id);
 	vty_out(vty, "  Sequence:       %u\n", virp_cfg.sequence);
+	vty_out(vty, "  Obs signed:     %lu\n",
+		(unsigned long)virp_cfg.obs_signed);
+	vty_out(vty, "  Obs delivered:  %lu\n",
+		(unsigned long)virp_cfg.obs_delivered);
+	vty_out(vty, "  Obs dropped:    %lu\n",
+		(unsigned long)virp_cfg.obs_dropped);
 	return CMD_SUCCESS;
 }
 
@@ -793,6 +1000,8 @@ DEFUN(show_bgp_virp_statistics,
 		(unsigned long)virp_cfg.obs_dropped);
 	vty_out(vty, "  Current sequence:       %u\n",
 		virp_cfg.sequence);
+	vty_out(vty, "  Producer ID:            %u\n",
+		virp_cfg.producer_id);
 	vty_out(vty, "  Sign failures:          %lu\n",
 		(unsigned long)virp_cfg.sign_failures);
 	vty_out(vty, "  Send failures:          %lu\n",
@@ -802,24 +1011,20 @@ DEFUN(show_bgp_virp_statistics,
 
 void bgp_virp_vty_init(void)
 {
-	/* Config commands under 'router bgp' */
 	install_element(BGP_NODE, &virp_enable_cmd);
 	install_element(BGP_NODE, &virp_disable_cmd);
 	install_element(BGP_NODE, &virp_onode_socket_cmd);
 	install_element(BGP_NODE, &virp_hmac_key_path_cmd);
 
-	/* Show commands */
 	install_element(VIEW_NODE, &show_bgp_virp_status_cmd);
 	install_element(ENABLE_NODE, &show_bgp_virp_status_cmd);
 	install_element(VIEW_NODE, &show_bgp_virp_statistics_cmd);
 	install_element(ENABLE_NODE, &show_bgp_virp_statistics_cmd);
 }
 
-/* ----------------------------------------------------------------
- * Module Init / Fini
- * ----------------------------------------------------------------
- * FRR module registration — same pattern as bgp_bmp.c
- */
+/* ================================================================
+ * Module Init / Fini — FRR_MODULE_SETUP pattern
+ * ================================================================ */
 
 static int bgp_virp_init(struct event_loop *tm)
 {
@@ -831,14 +1036,6 @@ static int bgp_virp_init(struct event_loop *tm)
 
 static int bgp_virp_module_init(void)
 {
-	/*
-	 * Register hook handlers — these four hooks give us complete
-	 * visibility into BGP state transitions and routing decisions.
-	 *
-	 * This is the Observation Channel only. No Intent Channel
-	 * operations are performed. The module cannot modify routes,
-	 * peer state, or any BGP configuration.
-	 */
 	hook_register(peer_status_changed, virp_peer_status_changed);
 	hook_register(peer_backward_transition, virp_peer_backward_transition);
 	hook_register(bgp_process, virp_bgp_process);
@@ -857,14 +1054,14 @@ static int bgp_virp_module_fini(void)
 	hook_unregister(peer_backward_transition, virp_peer_backward_transition);
 	hook_unregister(bgp_process, virp_bgp_process);
 	hook_unregister(bgp_route_update, virp_bgp_route_update);
+	hook_unregister(frr_late_init, bgp_virp_init);
 
 	if (virp_cfg.onode_fd >= 0) {
 		close(virp_cfg.onode_fd);
 		virp_cfg.onode_fd = -1;
 	}
 
-	/* Zeroize HMAC key material before shutdown */
-	explicit_bzero(virp_cfg.hmac_key, sizeof(virp_cfg.hmac_key));
+	virp_zeroize(virp_cfg.hmac_key, sizeof(virp_cfg.hmac_key));
 	virp_cfg.hmac_key_len = 0;
 
 	zlog_info("VIRP: module shutdown — signed=%lu delivered=%lu dropped=%lu",
