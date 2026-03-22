@@ -87,9 +87,9 @@ struct virp_config {
 
 	uint64_t obs_signed;
 	uint64_t obs_delivered;
-	uint64_t obs_dropped;
-	uint64_t sign_failures;
-	uint64_t send_failures;
+	uint64_t obs_build_fail;
+	uint64_t obs_sign_fail;
+	uint64_t obs_send_fail;
 
 	uint8_t hmac_key[VIRP_MAX_KEY_LEN];
 	size_t hmac_key_len;

@@ -21,6 +21,7 @@
 
 #include <zebra.h>
 
+#include "lib/version.h"
 #include "bgpd/bgpd.h"
 #include "bgpd/bgp_route.h"
 #include "bgpd/bgp_attr.h"
@@ -30,6 +31,7 @@
 #include "bgpd/bgp_table.h"
 #include "bgpd/bgp_virp.h"
 
+#include "lib/sockunion.h"
 #include "lib/vty.h"
 #include "lib/command.h"
 #include "lib/memory.h"
@@ -37,6 +39,7 @@
 #include "lib/log.h"
 #include "lib/hook.h"
 #include "lib/frr_pthread.h"
+#include "lib/libfrr.h"
 
 #include <arpa/inet.h>
 #include <openssl/hmac.h>
@@ -62,9 +65,9 @@ static struct virp_config virp_cfg = {
 	.producer_id = 0,
 	.obs_signed = 0,
 	.obs_delivered = 0,
-	.obs_dropped = 0,
-	.sign_failures = 0,
-	.send_failures = 0,
+	.obs_build_fail = 0,
+	.obs_sign_fail = 0,
+	.obs_send_fail = 0,
 };
 
 /* ================================================================
@@ -221,12 +224,20 @@ static void virp_peer_identity(struct peer *peer,
 			       char *peer_addr_buf, size_t peer_addr_len)
 {
 	const char *name = "unknown";
+	char peer_addr_raw[VIRP_ADDR_STRLEN];
 
 	if (peer && PEER_HOSTNAME(peer))
 		name = PEER_HOSTNAME(peer);
 
 	virp_json_escape(peer_buf, peer_len, name);
-	virp_json_escape(peer_addr_buf, peer_addr_len, name);
+
+	if (peer && peer->connection && peer->connection->su_remote)
+		sockunion2str(peer->connection->su_remote, peer_addr_raw,
+			      sizeof(peer_addr_raw));
+	else
+		strlcpy(peer_addr_raw, "0.0.0.0", sizeof(peer_addr_raw));
+
+	virp_json_escape(peer_addr_buf, peer_addr_len, peer_addr_raw);
 }
 
 static void virp_router_id_json(const struct bgp *bgp,
@@ -373,7 +384,7 @@ int virp_sign_record(struct virp_config *cfg, struct virp_record *rec)
 
 	if (!cfg || !rec || cfg->hmac_key_len == 0) {
 		if (cfg)
-			cfg->sign_failures++;
+			cfg->obs_sign_fail++;
 		return -1;
 	}
 
@@ -407,7 +418,7 @@ int virp_sign_record(struct virp_config *cfg, struct virp_record *rec)
 
 out:
 	if (rc != 0 && cfg)
-		cfg->sign_failures++;
+		cfg->obs_sign_fail++;
 
 	if (ctx)
 		HMAC_CTX_free(ctx);
@@ -479,7 +490,7 @@ int virp_send_record(struct virp_config *cfg, const struct virp_record *rec)
 		return -1;
 
 	if (virp_connect_onode(cfg) < 0) {
-		cfg->send_failures++;
+		cfg->obs_send_fail++;
 		return -1;
 	}
 
@@ -500,7 +511,7 @@ fail:
 	zlog_err("VIRP: send to O-Node failed: %s", strerror(errno));
 	close(cfg->onode_fd);
 	cfg->onode_fd = -1;
-	cfg->send_failures++;
+	cfg->obs_send_fail++;
 	return -1;
 }
 
@@ -508,7 +519,7 @@ fail:
  * virp_emit_json — single wrapper for all handlers
  *
  * Does init → sign → send and manages obs_signed / obs_delivered /
- * obs_dropped counters.
+ * obs_build_fail / obs_sign_fail / obs_send_fail counters.
  * ================================================================ */
 
 static int virp_emit_json(uint8_t obs_type,
@@ -528,7 +539,7 @@ static int virp_emit_json(uint8_t obs_type,
 	if (json_len > VIRP_MAX_PAYLOAD) {
 		zlog_warn("VIRP: JSON payload too large (%zu > %u)",
 			  json_len, VIRP_MAX_PAYLOAD);
-		virp_cfg.obs_dropped++;
+		virp_cfg.obs_build_fail++;
 		return -1;
 	}
 
@@ -542,19 +553,19 @@ static int virp_emit_json(uint8_t obs_type,
 			     ts,
 			     (const uint8_t *)json,
 			     json_len) != 0) {
-		virp_cfg.obs_dropped++;
+		virp_cfg.obs_build_fail++;
 		return -1;
 	}
 
 	if (virp_sign_record(&virp_cfg, &rec) != 0) {
-		virp_cfg.obs_dropped++;
+		virp_cfg.obs_sign_fail++;
 		return -1;
 	}
 
 	virp_cfg.obs_signed++;
 
 	if (virp_send_record(&virp_cfg, &rec) != 0) {
-		virp_cfg.obs_dropped++;
+		virp_cfg.obs_send_fail++;
 		zlog_info("VIRP[%u]: local-fallback type=%u tier=%u payload=%.*s",
 			  virp_cfg.sequence, obs_type, trust_tier,
 			  (int)json_len, json);
@@ -978,8 +989,12 @@ DEFUN(show_bgp_virp_status,
 		(unsigned long)virp_cfg.obs_signed);
 	vty_out(vty, "  Obs delivered:  %lu\n",
 		(unsigned long)virp_cfg.obs_delivered);
-	vty_out(vty, "  Obs dropped:    %lu\n",
-		(unsigned long)virp_cfg.obs_dropped);
+	vty_out(vty, "  Build failures: %lu\n",
+		(unsigned long)virp_cfg.obs_build_fail);
+	vty_out(vty, "  Sign failures:  %lu\n",
+		(unsigned long)virp_cfg.obs_sign_fail);
+	vty_out(vty, "  Send failures:  %lu\n",
+		(unsigned long)virp_cfg.obs_send_fail);
 	return CMD_SUCCESS;
 }
 
@@ -996,16 +1011,16 @@ DEFUN(show_bgp_virp_statistics,
 		(unsigned long)virp_cfg.obs_signed);
 	vty_out(vty, "  Observations delivered: %lu\n",
 		(unsigned long)virp_cfg.obs_delivered);
-	vty_out(vty, "  Observations dropped:   %lu\n",
-		(unsigned long)virp_cfg.obs_dropped);
+	vty_out(vty, "  Build failures:         %lu\n",
+		(unsigned long)virp_cfg.obs_build_fail);
+	vty_out(vty, "  Sign failures:          %lu\n",
+		(unsigned long)virp_cfg.obs_sign_fail);
+	vty_out(vty, "  Send failures:          %lu\n",
+		(unsigned long)virp_cfg.obs_send_fail);
 	vty_out(vty, "  Current sequence:       %u\n",
 		virp_cfg.sequence);
 	vty_out(vty, "  Producer ID:            %u\n",
 		virp_cfg.producer_id);
-	vty_out(vty, "  Sign failures:          %lu\n",
-		(unsigned long)virp_cfg.sign_failures);
-	vty_out(vty, "  Send failures:          %lu\n",
-		(unsigned long)virp_cfg.send_failures);
 	return CMD_SUCCESS;
 }
 
@@ -1026,6 +1041,8 @@ void bgp_virp_vty_init(void)
  * Module Init / Fini — FRR_MODULE_SETUP pattern
  * ================================================================ */
 
+static int bgp_virp_module_fini(void);
+
 static int bgp_virp_init(struct event_loop *tm)
 {
 	bgp_virp_vty_init();
@@ -1042,6 +1059,7 @@ static int bgp_virp_module_init(void)
 	hook_register(bgp_route_update, virp_bgp_route_update);
 
 	hook_register(frr_late_init, bgp_virp_init);
+	hook_register(frr_fini, bgp_virp_module_fini);
 
 	return 0;
 }
@@ -1055,6 +1073,7 @@ static int bgp_virp_module_fini(void)
 	hook_unregister(bgp_process, virp_bgp_process);
 	hook_unregister(bgp_route_update, virp_bgp_route_update);
 	hook_unregister(frr_late_init, bgp_virp_init);
+	hook_unregister(frr_fini, bgp_virp_module_fini);
 
 	if (virp_cfg.onode_fd >= 0) {
 		close(virp_cfg.onode_fd);
@@ -1064,10 +1083,12 @@ static int bgp_virp_module_fini(void)
 	virp_zeroize(virp_cfg.hmac_key, sizeof(virp_cfg.hmac_key));
 	virp_cfg.hmac_key_len = 0;
 
-	zlog_info("VIRP: module shutdown — signed=%lu delivered=%lu dropped=%lu",
+	zlog_info("VIRP: module shutdown — signed=%lu delivered=%lu build_fail=%lu sign_fail=%lu send_fail=%lu",
 		  (unsigned long)virp_cfg.obs_signed,
 		  (unsigned long)virp_cfg.obs_delivered,
-		  (unsigned long)virp_cfg.obs_dropped);
+		  (unsigned long)virp_cfg.obs_build_fail,
+		  (unsigned long)virp_cfg.obs_sign_fail,
+		  (unsigned long)virp_cfg.obs_send_fail);
 	return 0;
 }
 
@@ -1076,5 +1097,4 @@ FRR_MODULE_SETUP(.name = "bgpd_virp",
 		 .description = "VIRP signed BGP observation module "
 				"(draft-howard-virp-01)",
 		 .init = bgp_virp_module_init,
-		 .fini = bgp_virp_module_fini,
 );
